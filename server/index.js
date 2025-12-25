@@ -89,5 +89,6 @@ app.get("/v/:id", (req, res) => {
 });
 
 app.listen(PORT, () => {
+    console.log("test");
   console.log(`RealSnap MVP running on http://localhost:${PORT}`);
 });
