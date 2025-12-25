@@ -4,14 +4,33 @@ const path = require("path");
 const fs = require("fs");
 const QRCode = require("qrcode");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Storage (MVP: fichiers en local dans /server/uploads) ---
+// --- Dossiers ---
 const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const publicDir = path.join(__dirname, "public");
+const dbPath = path.join(__dirname, "db.json");
 
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+if (!fs.existsSync(dbPath)) fs.writeFileSync(dbPath, "{}");
+
+// --- Helpers DB JSON ---
+function readDb() {
+  try {
+    return JSON.parse(fs.readFileSync(dbPath, "utf-8") || "{}");
+  } catch {
+    return {};
+  }
+}
+function writeDb(db) {
+  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+}
+
+// --- Multer storage ---
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
@@ -22,73 +41,134 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// --- Middlewares ---
 app.use(express.json());
 app.use("/uploads", express.static(uploadDir));
-app.use("/public", express.static(path.join(__dirname, "public")));
+app.use("/public", express.static(publicDir));
 
-// Page d’accueil simple
+// --- Home ---
 app.get("/", (req, res) => {
   res.send(`
-    <h2>RealSnap MVP</h2>
-    <p>Upload une image → lien de vérification + QR</p>
-    <form action="/api/upload" method="post" enctype="multipart/form-data">
-      <input type="file" name="file" accept="image/*" required />
-      <button type="submit">Upload</button>
-    </form>
+    <div style="font-family:Arial;max-width:820px;margin:0 auto;padding:24px;">
+      <h2>RealSnap MVP</h2>
+      <p>Upload une image → lien de vérification + QR</p>
+      <form action="/api/upload" method="post" enctype="multipart/form-data" style="margin-top:16px;">
+        <input type="file" name="file" accept="image/*" required />
+        <button type="submit" style="margin-left:8px;">Upload</button>
+      </form>
+    </div>
   `);
 });
 
-// Upload
+// --- Upload ---
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Aucun fichier reçu" });
 
     const filename = req.file.filename;
-    const id = filename.split(".")[0]; // l’UUID
-    const verifyUrl = `${req.protocol}://${req.get("host")}/v/${id}`;
+    const id = filename.split(".")[0];
 
-    // Génère QR (data URL) + une image PNG dans /public
+    // Base URL (Codespaces/Proxy safe)
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const verifyUrl = `${baseUrl}/v/${id}`;
+
+    // Hash SHA-256
+    const fileBuffer = fs.readFileSync(req.file.path);
+    const hash = crypto.createHash("sha256").update(fileBuffer).digest("hex");
+    const createdAt = new Date().toISOString();
+
+    // Save record in db.json
+    const db = readDb();
+    db[id] = {
+      id,
+      filename,
+      originalUrl: `/uploads/${filename}`,
+      verifyUrl,
+      hash,
+      createdAt,
+    };
+    writeDb(db);
+
+    // Generate QR (data URL + png)
     const qrDataUrl = await QRCode.toDataURL(verifyUrl);
-    const qrPngPath = path.join(__dirname, "public", `${id}.png`);
+    const qrPngPath = path.join(publicDir, `${id}.png`);
     await QRCode.toFile(qrPngPath, verifyUrl, { width: 320 });
 
     return res.send(`
-      <h2>✅ Upload OK</h2>
-      <p><b>Lien de vérification :</b> <a href="${verifyUrl}" target="_blank">${verifyUrl}</a></p>
-      <p><b>QR Code :</b></p>
-      <img src="${qrDataUrl}" />
-      <p>PNG direct : <a href="/public/${id}.png" target="_blank">/public/${id}.png</a></p>
-      <p>Fichier original : <a href="/uploads/${filename}" target="_blank">/uploads/${filename}</a></p>
-      <p><a href="/">⬅️ Revenir</a></p>
+      <div style="font-family:Arial;max-width:820px;margin:0 auto;padding:24px;">
+        <h2>✅ Upload OK</h2>
+
+        <p><b>Lien de vérification :</b><br/>
+          <a href="${verifyUrl}" target="_blank">${verifyUrl}</a>
+        </p>
+
+        <p><b>Hash SHA-256 :</b><br/>
+          <code style="word-break:break-all;display:block;background:#f7f7f7;padding:10px;border-radius:8px;">
+            ${hash}
+          </code>
+        </p>
+
+        <p><b>QR Code :</b></p>
+        <img src="${qrDataUrl}" style="border:1px solid #eee;border-radius:12px;" />
+
+        <p style="margin-top:12px;">
+          PNG direct : <a href="/public/${id}.png" target="_blank">/public/${id}.png</a><br/>
+          Fichier original : <a href="/uploads/${filename}" target="_blank">/uploads/${filename}</a>
+        </p>
+
+        <p><a href="/">⬅️ Revenir</a></p>
+      </div>
     `);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Erreur serveur" });
+    return res.status(500).json({ error: "Erreur serveur" });
   }
 });
 
-// Page de vérification (scanner QR -> arrive ici)
+// --- Verify page ---
 app.get("/v/:id", (req, res) => {
   const { id } = req.params;
 
-  // Cherche un fichier dont le nom commence par id.
-  const files = fs.readdirSync(uploadDir);
-  const match = files.find((f) => f.startsWith(id));
+  const db = readDb();
+  const record = db[id];
 
-  if (!match) {
-    return res.status(404).send(`<h2>❌ Introuvable</h2><p>Aucun original pour cet ID.</p>`);
+  if (!record) {
+    return res.status(404).send(`
+      <div style="font-family:Arial;max-width:820px;margin:0 auto;padding:24px;">
+        <h2>❌ Introuvable</h2>
+        <p>Aucun original enregistré pour cet ID.</p>
+      </div>
+    `);
   }
 
-  res.send(`
-    <h2>✅ Verified by RealSnap (MVP)</h2>
-    <p><b>ID:</b> ${id}</p>
-    <p><b>Original stocké:</b></p>
-    <img src="/uploads/${match}" style="max-width: 600px; width: 100%; border: 1px solid #ddd;" />
-    <p><a href="/uploads/${match}" target="_blank">Ouvrir l’original</a></p>
+  return res.send(`
+    <div style="font-family:Arial;max-width:820px;margin:0 auto;padding:24px;">
+      <h2 style="margin-bottom:6px;">✅ Verified by RealSnap (MVP)</h2>
+      <p style="margin-top:0;color:#444;">Preuve d’originalité (prototype)</p>
+
+      <div style="border:1px solid #eee;border-radius:12px;padding:16px;margin:16px 0;">
+        <p><b>ID:</b> ${record.id}</p>
+        <p><b>Date d’enregistrement:</b> ${record.createdAt}</p>
+        <p><b>Hash SHA-256:</b></p>
+        <code style="word-break:break-all;display:block;background:#f7f7f7;padding:10px;border-radius:8px;">
+          ${record.hash}
+        </code>
+      </div>
+
+      <div style="border:1px solid #eee;border-radius:12px;padding:16px;">
+        <p style="margin-top:0;"><b>Original stocké:</b></p>
+        <img src="${record.originalUrl}" style="max-width:100%;border:1px solid #ddd;border-radius:12px;" />
+        <p style="margin-bottom:0;">
+          <a href="${record.originalUrl}" target="_blank">Ouvrir / Télécharger l’original</a>
+        </p>
+      </div>
+    </div>
   `);
 });
 
-app.listen(PORT, () => {
-    console.log("test");
+// --- Start ---
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`RealSnap MVP running on http://localhost:${PORT}`);
 });
+
+

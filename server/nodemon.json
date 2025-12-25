@@ -1,0 +1,7 @@
+{
+  "watch": ["index.js"],
+  "ignore": ["uploads/*", "public/*", "db.json"],
+  "ext": "js,json",
+  "delay": "300"
+}
+
